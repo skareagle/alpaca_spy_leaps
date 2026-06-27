@@ -191,6 +191,20 @@ def send_weekly_summary():
     state["last_summary_week"] = current_week
     save_state(state)
 
+def log_positions_status():
+    try:
+        positions = trading_client.get_all_positions()
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not positions:
+            print(f"[{now_str}] Market is open. Checking positions: No open positions.")
+            return
+        
+        print(f"[{now_str}] Market is open. Checking positions:")
+        for pos in positions:
+            print(f"  - {pos.symbol}: Qty {pos.qty}, Market Value: {pos.market_value}, Unrealized PnL: {pos.unrealized_pl} ({float(pos.unrealized_plpc)*100:.2f}%)")
+    except Exception as e:
+        print(f"Error checking positions: {e}")
+
 def main():
     if not trading_client:
         print("Please configure your Alpaca API keys in .env file.")
@@ -200,18 +214,33 @@ def main():
     while True:
         try:
             clock = trading_client.get_clock()
-            if clock.is_open:
-                check_leaps_strategy()
-                
+            
             # Send summary on Friday (weekday 4)
             # We do it regardless of market open/close (in case it's a holiday we still want it or just late Friday)
             if datetime.date.today().weekday() == 4:
                 send_weekly_summary()
                 
+            if not clock.is_open:
+                next_open = clock.next_open
+                now = datetime.datetime.now(datetime.timezone.utc)
+                time_to_open = (next_open - now).total_seconds()
+                
+                sleep_time = time_to_open - 3600
+                if sleep_time > 0:
+                    print(f"[{datetime.datetime.now()}] Markets are closed. Next open is at {next_open}. Sleeping for {sleep_time:.0f} seconds till within 1 hour of next market open.")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"[{datetime.datetime.now()}] Markets are closed, but within 1 hour of next open ({next_open}). Sleeping for 60 seconds.")
+                    time.sleep(60)
+                continue
+                
+            log_positions_status()
+            check_leaps_strategy()
+                
         except Exception as e:
             print(f"Error: {e}")
             
-        time.sleep(360) # Check every 6 minutes
+        time.sleep(600) # Check every 10 minutes
 
 if __name__ == "__main__":
     main()
