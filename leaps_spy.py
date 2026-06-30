@@ -63,7 +63,7 @@ def get_current_price(symbol):
     quote = stock_data_client.get_stock_latest_quote(request)
     return quote[symbol].ask_price
 
-def get_furthest_atm_call(symbol, current_price):
+def get_furthest_atm_calls_sorted(symbol, current_price):
     future_date = datetime.date.today() + datetime.timedelta(days=180) # Look at least 6 months out
     req = GetOptionContractsRequest(
         underlying_symbols=[symbol],
@@ -75,26 +75,23 @@ def get_furthest_atm_call(symbol, current_price):
     
     contracts = trading_client.get_option_contracts(req)
     if not contracts or not contracts.option_contracts:
-        return None
+        return []
 
     available_dates = sorted(list(set(c.expiration_date for c in contracts.option_contracts)))
     if not available_dates:
-        return None
+        return []
     
     furthest_date = available_dates[-1]
     
-    best_contract = None
-    min_diff = float('inf')
-    for contract in contracts.option_contracts:
-        if contract.expiration_date == furthest_date:
-            diff = abs(float(contract.strike_price) - current_price)
-            if diff < min_diff:
-                min_diff = diff
-                best_contract = contract
+    furthest_contracts = [c for c in contracts.option_contracts if c.expiration_date == furthest_date]
+    furthest_contracts.sort(key=lambda c: abs(float(c.strike_price) - current_price))
+    return furthest_contracts
 
-    return best_contract
+def get_furthest_atm_call(symbol, current_price):
+    contracts = get_furthest_atm_calls_sorted(symbol, current_price)
+    return contracts[0] if contracts else None
 
-def place_order(symbol, qty, side, reason=""):
+def place_order(symbol, qty, side, reason="", silent=False):
     req = MarketOrderRequest(
         symbol=symbol,
         qty=abs(qty),
@@ -104,10 +101,43 @@ def place_order(symbol, qty, side, reason=""):
     res = trading_client.submit_order(order_data=req)
     msg = f"🟢 <b>TRADE EXECUTED</b>\nSide: {side.name}\nQty: {abs(qty)}\nSymbol: {symbol}\nReason: {reason}\nOrder ID: {res.id}"
     print(msg.replace('<b>', '').replace('</b>', ''))
-    send_telegram_message(msg)
+    if not silent:
+        send_telegram_message(msg)
     return res
 
-def check_leaps_strategy():
+def buy_leaps_with_retry(symbol_base, current_price, reason):
+    contracts = get_furthest_atm_calls_sorted(symbol_base, current_price)
+    for contract in contracts[:3]: # Try up to 3 closest strikes
+        res = place_order(contract.symbol, 1, OrderSide.BUY, f"{reason} (Strike {contract.strike_price})", silent=True)
+        
+        # Wait up to 30s for fill
+        filled = False
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                order = trading_client.get_order_by_id(res.id)
+                if order.status == "filled":
+                    filled = True
+                    break
+                if order.status in ["canceled", "rejected", "expired"]:
+                    break
+            except Exception:
+                pass
+                
+        if filled:
+            msg = f"🟢 <b>TRADE FILLED</b>\nSide: BUY\nQty: 1\nSymbol: {contract.symbol}\nReason: {reason}\nOrder ID: {res.id}"
+            send_telegram_message(msg)
+            print(f"Order filled for {contract.symbol}")
+            return contract
+        else:
+            print(f"Order for {contract.symbol} not filled. Canceling and trying next strike.")
+            try:
+                trading_client.cancel_order_by_id(res.id)
+            except Exception as e:
+                print(f"Error canceling order: {e}")
+    return None
+
+def check_leaps_strategy(clock):
     state = load_state()
     today = datetime.date.today()
     current_week = f"{today.year}-W{today.isocalendar()[1]}"
@@ -143,7 +173,7 @@ def check_leaps_strategy():
                 place_order(pos.symbol, int(pos.qty), OrderSide.SELL, "Position >= 366 days old")
                 continue
 
-    if current_week != state["last_buy_week"]:
+    if current_week != state.get("last_buy_week"):
         current_price = get_current_price(SYMBOL)
         print(f"New week {current_week} detected. Current {SYMBOL} price: {current_price}")
         
@@ -155,6 +185,41 @@ def check_leaps_strategy():
             save_state(state)
         else:
             print("Failed to find suitable contract to buy.")
+
+    # 1% Daily Drop logic
+    if clock.is_open:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        time_to_close = (clock.next_close - now).total_seconds()
+        
+        # Check if we are in the final hour of trading
+        if 0 < time_to_close <= 3600:
+            today_str = today.strftime("%Y-%m-%d")
+            if state.get("last_daily_drop_buy_date") != today_str:
+                from alpaca.data.requests import StockSnapshotRequest
+                try:
+                    req = StockSnapshotRequest(symbol_or_symbols=[SYMBOL])
+                    snap = stock_data_client.get_stock_snapshot(req)
+                    if SYMBOL in snap:
+                        spy_snap = snap[SYMBOL]
+                        prev_close = spy_snap.previous_daily_bar.close
+                        current_price = spy_snap.latest_quote.ask_price
+                        
+                        if prev_close > 0:
+                            drop_pct = (prev_close - current_price) / prev_close
+                            if drop_pct > 0.01:
+                                msg = f"🚨 Detected >1% drop today in final hour. Drop: {drop_pct*100:.2f}%. Prev Close: {prev_close}, Current: {current_price}"
+                                print(msg)
+                                send_telegram_message(msg)
+                                
+                                contract = buy_leaps_with_retry(SYMBOL, current_price, "Daily >1% drop in final hour")
+                                if contract:
+                                    state["last_daily_drop_buy_date"] = today_str
+                                    state["positions_buy_dates"][contract.symbol] = today_str
+                                    save_state(state)
+                                else:
+                                    print("Failed to buy LEAPS for daily drop condition even after retries.")
+                except Exception as e:
+                    print(f"Error checking daily drop condition: {e}")
 
 def send_weekly_summary():
     state = load_state()
@@ -235,7 +300,7 @@ def main():
                 continue
                 
             log_positions_status()
-            check_leaps_strategy()
+            check_leaps_strategy(clock)
                 
         except Exception as e:
             print(f"Error: {e}")
