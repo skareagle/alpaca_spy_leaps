@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import json
+import subprocess
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, QueryOrderStatus
@@ -326,12 +327,22 @@ def log_positions_status():
     except Exception as e:
         print(f"Error checking positions: {e}")
 
+def get_git_commit():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.STDOUT).decode('utf-8').strip()
+    except Exception:
+        return "unknown"
+
 def main():
     if not trading_client:
         print("Please configure your Alpaca API keys in .env file.")
         return
 
-    print(f"Starting LEAPS Strategy for {SYMBOL} on Alpaca Paper: {PAPER}")
+    commit_hash = get_git_commit()
+    startup_msg = f"🚀 Starting LEAPS Strategy for {SYMBOL} on Alpaca Paper: {PAPER}\nVersion (Commit): {commit_hash}"
+    print(startup_msg)
+    send_telegram_message(startup_msg)
+    
     while True:
         try:
             clock = trading_client.get_clock()
