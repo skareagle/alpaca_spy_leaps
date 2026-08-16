@@ -333,6 +333,91 @@ def get_git_commit():
     except Exception:
         return "unknown"
 
+def init_telegram_polling():
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data.get("ok") and data["result"]:
+            return data["result"][-1]["update_id"]
+    except:
+        pass
+    return None
+
+def send_current_positions():
+    try:
+        positions = trading_client.get_all_positions()
+        open_leaps = []
+        for pos in positions:
+            if pos.asset_class == AssetClass.US_OPTION and pos.symbol.startswith(SYMBOL) and int(pos.qty) > 0:
+                open_leaps.append(pos)
+                
+        summary_lines = ["📈 <b>Current Positions</b>"]
+        if not open_leaps:
+            summary_lines.append("No open positions.")
+        else:
+            for pos in open_leaps:
+                market_value = float(pos.market_value)
+                unrealized_pl = float(pos.unrealized_pl)
+                unrealized_plpc = float(pos.unrealized_plpc) * 100
+                summary_lines.append(f"• {pos.symbol}: Value ${market_value:.2f} | P/L: ${unrealized_pl:+.2f} ({unrealized_plpc:+.2f}%)")
+                
+        send_telegram_message("\n".join(summary_lines))
+    except Exception as e:
+        send_telegram_message(f"Error fetching positions: {e}")
+
+def do_adhoc_buy():
+    send_telegram_message("⏳ Checking for furthest ATM call to purchase...")
+    try:
+        current_price = get_current_price(SYMBOL)
+        contract = get_furthest_atm_call(SYMBOL, current_price)
+        if contract:
+            res = place_order(contract.symbol, 1, OrderSide.BUY, "Adhoc User Telegram Command")
+            state = load_state()
+            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            state["positions_buy_dates"][contract.symbol] = today_str
+            save_state(state)
+        else:
+            send_telegram_message("❌ Failed to find a suitable contract.")
+    except Exception as e:
+        send_telegram_message(f"Error executing buy: {e}")
+
+def handle_telegram_updates(last_update_id):
+    if not TELEGRAM_BOT_TOKEN:
+        return last_update_id
+        
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": 5}
+    if last_update_id:
+        params["offset"] = last_update_id + 1
+        
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            for update in data["result"]:
+                update_id = update["update_id"]
+                last_update_id = update_id
+                
+                msg = update.get("message", {})
+                text = msg.get("text", "").strip()
+                chat_id = msg.get("chat", {}).get("id")
+                
+                if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                    continue
+                    
+                if text.lower() in ["/positions", "positions"]:
+                    send_current_positions()
+                elif text.lower() in ["/buy", "buy"]:
+                    do_adhoc_buy()
+                    
+    except Exception:
+        pass
+        
+    return last_update_id
+
 def main():
     if not trading_client:
         print("Please configure your Alpaca API keys in .env file.")
@@ -342,53 +427,46 @@ def main():
     startup_msg = f"🚀 Starting LEAPS Strategy for {SYMBOL} on Alpaca Paper: {PAPER}\nVersion (Commit): {commit_hash}"
     print(startup_msg)
     send_telegram_message(startup_msg)
+    last_update_id = init_telegram_polling()
+    last_strategy_check = 0
     
     while True:
-        try:
-            clock = trading_client.get_clock()
-            
-            # Check for end of day summaries (Daily & Weekly)
-            now = datetime.datetime.now(datetime.timezone.utc)
-            time_to_open = (clock.next_open - now).total_seconds()
-            
-            # Market is closed and next open is more than 12 hours away (meaning day session has ended)
-            is_after_market_close = not clock.is_open and time_to_open > 12 * 3600
-            
-            if is_after_market_close:
-                state = load_state()
-                today_str = datetime.date.today().strftime("%Y-%m-%d")
+        last_update_id = handle_telegram_updates(last_update_id)
+        
+        now_ts = time.time()
+        if now_ts - last_strategy_check >= 600:
+            last_strategy_check = now_ts
+            try:
+                clock = trading_client.get_clock()
                 
-                if state.get("last_daily_summary_date") != today_str:
-                    send_daily_summary()
-                    state["last_daily_summary_date"] = today_str
-                    save_state(state)
-                    
-                if datetime.date.today().weekday() == 4 and state.get("last_weekly_summary_date") != today_str:
-                    send_weekly_summary()
-                    state["last_weekly_summary_date"] = today_str
-                    save_state(state)
-                
-            if not clock.is_open:
-                next_open = clock.next_open
+                # Check for end of day summaries (Daily & Weekly)
                 now = datetime.datetime.now(datetime.timezone.utc)
-                time_to_open = (next_open - now).total_seconds()
+                time_to_open = (clock.next_open - now).total_seconds()
                 
-                sleep_time = time_to_open - 3600
-                if sleep_time > 0:
-                    print(f"[{datetime.datetime.now()}] Markets are closed. Next open is at {next_open}. Sleeping for {sleep_time:.0f} seconds till within 1 hour of next market open.")
-                    time.sleep(sleep_time)
-                else:
-                    print(f"[{datetime.datetime.now()}] Markets are closed, but within 1 hour of next open ({next_open}). Sleeping for 60 seconds.")
-                    time.sleep(60)
-                continue
+                is_after_market_close = not clock.is_open and time_to_open > 12 * 3600
                 
-            log_positions_status()
-            check_leaps_strategy(clock)
+                if is_after_market_close:
+                    state = load_state()
+                    today_str = datetime.date.today().strftime("%Y-%m-%d")
+                    
+                    if state.get("last_daily_summary_date") != today_str:
+                        send_daily_summary()
+                        state["last_daily_summary_date"] = today_str
+                        save_state(state)
+                        
+                    if datetime.date.today().weekday() == 4 and state.get("last_weekly_summary_date") != today_str:
+                        send_weekly_summary()
+                        state["last_weekly_summary_date"] = today_str
+                        save_state(state)
+                    
+                if clock.is_open:
+                    log_positions_status()
+                    check_leaps_strategy(clock)
+                    
+            except Exception as e:
+                print(f"Error: {e}")
                 
-        except Exception as e:
-            print(f"Error: {e}")
-            
-        time.sleep(600) # Check every 10 minutes
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
