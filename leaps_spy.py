@@ -3,8 +3,8 @@ import time
 import datetime
 import json
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, QueryOrderStatus
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -221,14 +221,58 @@ def check_leaps_strategy(clock):
                 except Exception as e:
                     print(f"Error checking daily drop condition: {e}")
 
-def send_weekly_summary():
-    state = load_state()
-    today = datetime.date.today()
-    current_week = f"{today.year}-W{today.isocalendar()[1]}"
+def get_open_lots(symbol, current_qty):
+    req = GetOrdersRequest(
+        status=QueryOrderStatus.CLOSED,
+        symbols=[symbol],
+        side=OrderSide.BUY,
+        limit=100
+    )
+    orders = trading_client.get_orders(req)
+    filled_orders = [o for o in orders if o.status == "filled"]
+    filled_orders.sort(key=lambda x: x.filled_at, reverse=True)
     
-    if current_week == state["last_summary_week"]:
-        return # Already sent this week
+    lots = []
+    remaining_qty = int(current_qty)
+    for o in filled_orders:
+        if remaining_qty <= 0:
+            break
+        qty = int(o.filled_qty)
+        if qty > remaining_qty:
+            qty = remaining_qty
+            
+        lots.append({
+            "buy_date": o.filled_at.strftime("%Y-%m-%d"),
+            "qty": qty,
+            "entry_price": float(o.filled_avg_price)
+        })
+        remaining_qty -= qty
+        
+    lots.reverse()
+    return lots
 
+def send_daily_summary():
+    positions = trading_client.get_all_positions()
+    open_leaps = []
+    
+    for pos in positions:
+        if pos.asset_class == AssetClass.US_OPTION and pos.symbol.startswith(SYMBOL) and int(pos.qty) > 0:
+            open_leaps.append(pos)
+            
+    summary_lines = ["📈 <b>Daily P/L Report</b>"]
+    if not open_leaps:
+        summary_lines.append("No open positions.")
+    else:
+        for pos in open_leaps:
+            intraday_plpc = float(pos.unrealized_intraday_plpc) * 100
+            intraday_pl = float(pos.unrealized_intraday_pl)
+            summary_lines.append(f"• {pos.symbol}: ${intraday_pl:+.2f} ({intraday_plpc:+.2f}%) today")
+            
+    summary_msg = "\n".join(summary_lines)
+    send_telegram_message(summary_msg)
+    print("Sent daily summary.")
+
+def send_weekly_summary():
     positions = trading_client.get_all_positions()
     open_leaps = []
     
@@ -241,20 +285,32 @@ def send_weekly_summary():
         summary_lines.append("No open positions.")
     else:
         for pos in open_leaps:
-            avg_entry = float(pos.avg_entry_price)
             current_value = float(pos.current_price)
-            if avg_entry > 0:
-                profit_pct = ((current_value - avg_entry) / avg_entry) * 100
+            current_qty = int(pos.qty)
+            lots = get_open_lots(pos.symbol, current_qty)
+            
+            if lots:
+                for lot in lots:
+                    entry = lot["entry_price"]
+                    qty = lot["qty"]
+                    buy_date = lot["buy_date"]
+                    if entry > 0:
+                        profit_pct = ((current_value - entry) / entry) * 100
+                    else:
+                        profit_pct = 0.0
+                    summary_lines.append(f"• {pos.symbol} (Opened {buy_date}, Qty {qty}): {profit_pct:+.2f}%")
             else:
-                profit_pct = 0.0
-            summary_lines.append(f"• {pos.symbol}: {profit_pct:+.2f}%")
+                # Fallback if no lots found
+                avg_entry = float(pos.avg_entry_price)
+                if avg_entry > 0:
+                    profit_pct = ((current_value - avg_entry) / avg_entry) * 100
+                else:
+                    profit_pct = 0.0
+                summary_lines.append(f"• {pos.symbol}: {profit_pct:+.2f}%")
             
     summary_msg = "\n".join(summary_lines)
     send_telegram_message(summary_msg)
     print("Sent weekly summary.")
-    
-    state["last_summary_week"] = current_week
-    save_state(state)
 
 def log_positions_status():
     try:
@@ -280,10 +336,26 @@ def main():
         try:
             clock = trading_client.get_clock()
             
-            # Send summary on Friday (weekday 4)
-            # We do it regardless of market open/close (in case it's a holiday we still want it or just late Friday)
-            if datetime.date.today().weekday() == 4:
-                send_weekly_summary()
+            # Check for end of day summaries (Daily & Weekly)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            time_to_open = (clock.next_open - now).total_seconds()
+            
+            # Market is closed and next open is more than 12 hours away (meaning day session has ended)
+            is_after_market_close = not clock.is_open and time_to_open > 12 * 3600
+            
+            if is_after_market_close:
+                state = load_state()
+                today_str = datetime.date.today().strftime("%Y-%m-%d")
+                
+                if state.get("last_daily_summary_date") != today_str:
+                    send_daily_summary()
+                    state["last_daily_summary_date"] = today_str
+                    save_state(state)
+                    
+                if datetime.date.today().weekday() == 4 and state.get("last_weekly_summary_date") != today_str:
+                    send_weekly_summary()
+                    state["last_weekly_summary_date"] = today_str
+                    save_state(state)
                 
             if not clock.is_open:
                 next_open = clock.next_open
