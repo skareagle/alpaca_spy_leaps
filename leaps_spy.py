@@ -368,21 +368,42 @@ def send_current_positions():
     except Exception as e:
         send_telegram_message(f"Error fetching positions: {e}")
 
-def do_adhoc_buy():
+def execute_adhoc_buy():
+    print("Executing ad-hoc buy...")
     send_telegram_message("⏳ Checking for furthest ATM call to purchase...")
     try:
         current_price = get_current_price(SYMBOL)
         contract = get_furthest_atm_call(SYMBOL, current_price)
         if contract:
+            print(f"Ad-hoc buy: placing order for {contract.symbol}")
             res = place_order(contract.symbol, 1, OrderSide.BUY, "Adhoc User Telegram Command")
             state = load_state()
             today_str = datetime.date.today().strftime("%Y-%m-%d")
             state["positions_buy_dates"][contract.symbol] = today_str
             save_state(state)
+            print(f"Ad-hoc buy executed and state updated for {contract.symbol}")
         else:
+            print("Ad-hoc buy: failed to find suitable contract.")
             send_telegram_message("❌ Failed to find a suitable contract.")
     except Exception as e:
+        print(f"Error executing ad-hoc buy: {e}")
         send_telegram_message(f"Error executing buy: {e}")
+
+def do_adhoc_buy():
+    print("Received ad-hoc buy request from Telegram.")
+    try:
+        clock = trading_client.get_clock()
+        if not clock.is_open:
+            print("Market is closed. Queuing ad-hoc buy for next open.")
+            send_telegram_message("🕒 Market is currently closed. Queuing your ad-hoc buy order for market open.")
+            state = load_state()
+            state["queued_adhoc_buy"] = True
+            save_state(state)
+        else:
+            execute_adhoc_buy()
+    except Exception as e:
+        print(f"Error handling ad-hoc buy request: {e}")
+        send_telegram_message(f"Error handling ad-hoc buy: {e}")
 
 def handle_telegram_updates(last_update_id):
     if not TELEGRAM_BOT_TOKEN:
@@ -402,19 +423,26 @@ def handle_telegram_updates(last_update_id):
                 last_update_id = update_id
                 
                 msg = update.get("message", {})
+                if not msg:
+                    continue
+                    
                 text = msg.get("text", "").strip()
                 chat_id = msg.get("chat", {}).get("id")
                 
                 if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                    print(f"Ignoring message from unknown chat_id: {chat_id}")
                     continue
                     
-                if text.lower() in ["/positions", "positions"]:
+                print(f"Received command: {text}")
+                if text.lower() in ["/positions", "positions", "/position", "position"]:
                     send_current_positions()
                 elif text.lower() in ["/buy", "buy"]:
                     do_adhoc_buy()
+        else:
+            print(f"Telegram polling returned not ok: {data}")
                     
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Telegram polling error: {e}")
         
     return last_update_id
 
@@ -460,6 +488,14 @@ def main():
                         save_state(state)
                     
                 if clock.is_open:
+                    state = load_state()
+                    if state.get("queued_adhoc_buy"):
+                        print("Market is open. Executing queued ad-hoc buy...")
+                        send_telegram_message("🔔 Market is now open! Processing your queued ad-hoc buy...")
+                        execute_adhoc_buy()
+                        state["queued_adhoc_buy"] = False
+                        save_state(state)
+                        
                     log_positions_status()
                     check_leaps_strategy(clock)
                     
