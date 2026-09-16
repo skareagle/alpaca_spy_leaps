@@ -349,24 +349,28 @@ def init_telegram_polling():
 def send_current_positions():
     try:
         positions = trading_client.get_all_positions()
-        open_leaps = []
+        open_positions = []
         for pos in positions:
-            if pos.asset_class == AssetClass.US_OPTION and pos.symbol.startswith(SYMBOL) and int(pos.qty) > 0:
-                open_leaps.append(pos)
+            if int(pos.qty) != 0:
+                open_positions.append(pos)
                 
         summary_lines = ["📈 <b>Current Positions</b>"]
-        if not open_leaps:
+        if not open_positions:
             summary_lines.append("No open positions.")
         else:
-            for pos in open_leaps:
+            for pos in open_positions:
                 market_value = float(pos.market_value)
                 unrealized_pl = float(pos.unrealized_pl)
                 unrealized_plpc = float(pos.unrealized_plpc) * 100
-                summary_lines.append(f"• {pos.symbol}: Value ${market_value:.2f} | P/L: ${unrealized_pl:+.2f} ({unrealized_plpc:+.2f}%)")
+                summary_lines.append(f"• {pos.symbol} (Qty {pos.qty}): Value ${market_value:.2f} | P/L: ${unrealized_pl:+.2f} ({unrealized_plpc:+.2f}%)")
                 
-        send_telegram_message("\n".join(summary_lines))
+        msg = "\n".join(summary_lines)
+        print(msg.replace('<b>', '').replace('</b>', ''))
+        send_telegram_message(msg)
     except Exception as e:
-        send_telegram_message(f"Error fetching positions: {e}")
+        err_msg = f"Error fetching positions: {e}"
+        print(err_msg)
+        send_telegram_message(err_msg)
 
 def execute_adhoc_buy():
     print("Executing ad-hoc buy...")
@@ -455,6 +459,7 @@ def main():
     startup_msg = f"🚀 Starting LEAPS Strategy for {SYMBOL} on Alpaca Paper: {PAPER}\nVersion (Commit): {commit_hash}"
     print(startup_msg)
     send_telegram_message(startup_msg)
+    send_current_positions()
     last_update_id = init_telegram_polling()
     last_strategy_check = 0
     
