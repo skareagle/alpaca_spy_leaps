@@ -1,0 +1,28 @@
+# systemd *user* unit for the SPY LEAPS trading bot.
+# WARNING: two running instances can double-buy. Stop any manually started
+# bot first (`pgrep -af leaps_spy`) before starting this service.
+# Install (see README.md, "Run on startup"):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/leaps-spy.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable leaps-spy     # start on next boot
+#   systemctl --user start leaps-spy      # start now (only if no manual instance)
+#   loginctl enable-linger "$USER"        # start at boot without logging in
+# Logs: journalctl --user -u leaps-spy -f
+# If you move the repo, fix WorkingDirectory and ExecStart below.
+
+[Unit]
+Description=SPY LEAPS trading bot (Alpaca + Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/shreyas/projects/workspace/alpaca_spy_leaps
+ExecStart=/home/shreyas/projects/workspace/alpaca_spy_leaps/run.sh
+# A clean exit of the long-running trading loop is never intended.
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

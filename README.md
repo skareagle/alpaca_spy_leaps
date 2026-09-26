@@ -57,13 +57,43 @@ TELEGRAM_CHAT_ID=your_telegram_chat_id
 
 ## Usage
 
-To start the trading bot, run the main Python script:
+To start the trading bot, run the launcher from anywhere:
 
 ```bash
-python leaps_spy.py
+./run.sh
 ```
 
+`run.sh` changes to the repository root and runs `leaps_spy.py` with the `venv/` Python, so the virtual environment must exist at `venv/` (see Installation). You can also run `python leaps_spy.py` from the repository root with the venv activated.
+
 The bot will print its status to the console, checking the market and evaluating positions every 6 minutes while the market is open. Make sure to keep the script running on a server or a machine that stays on during market hours.
+
+## Run on startup
+
+On Linux, `deploy/leaps-spy.service` is a systemd *user* unit that runs `run.sh`, restarts it 30 seconds after it exits, and logs to the journal.
+
+> **Warning:** two running instances can double-buy. Stop any manually started bot first (`pgrep -af leaps_spy`).
+
+Install and enable it:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/leaps-spy.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable leaps-spy     # start on next boot
+systemctl --user start leaps-spy      # start now (only if no manual instance)
+loginctl enable-linger "$USER"        # start at boot without logging in
+```
+
+Manage it:
+
+```bash
+systemctl --user status leaps-spy
+systemctl --user stop leaps-spy
+systemctl --user disable leaps-spy    # don't start on boot
+journalctl --user -u leaps-spy -f     # follow logs
+```
+
+The unit contains absolute paths to this repository; if you move the repo, update `WorkingDirectory` and `ExecStart` in the copied unit and run `systemctl --user daemon-reload`. The service does not wait for the network at boot. A bot that starts offline does not exit: it keeps retrying on its own (Telegram polling every few seconds, Alpaca every 10 minutes), though its startup Telegram message may be lost; `Restart=always` only covers a crash. Also, Telegram commands sent while the bot was offline (including `/buy`) may be executed once the network comes up.
 
 ## Disclaimer
 
